@@ -1,0 +1,936 @@
+# =============================================================================
+# Latent Volatility as a Stochastic Process:
+# A Kalman Filter Approach to Volatility Risk Premium Estimation
+# Parker Scott
+# =============================================================================
+
+
+# =============================================================================
+# CELL 1 | Install & Imports
+# =============================================================================
+
+# In Colab, uncomment and run this line first:
+# !pip install yfinance statsmodels --quiet
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import warnings
+warnings.filterwarnings('ignore')
+
+import yfinance as yf
+from scipy.optimize import minimize
+from scipy.stats import t as t_dist
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools.tools import add_constant
+
+# Plot style
+plt.rcParams.update({
+    'figure.figsize': (12, 5),
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'axes.grid': True,
+    'grid.alpha': 0.3,
+    'font.size': 11,
+})
+
+print("Imports complete. Dependencies: numpy, pandas, scipy, statsmodels, yfinance.")
+
+
+# =============================================================================
+# CELL 2 | Step 1 — Data Acquisition and Preprocessing
+# =============================================================================
+
+START = '2015-01-01'
+END   = '2025-01-01'
+RV_WINDOW = 21          # trading days (~1 month)
+ANNUALIZE  = np.sqrt(252)
+
+print(f"Downloading data: {START} to {END} ...")
+
+# Download raw price series
+spy_raw = yf.download('SPY',  start=START, end=END, progress=False)
+vix_raw = yf.download('^VIX', start=START, end=END, progress=False)
+
+# S&P 500 log returns and rolling realized vol
+spy_close = spy_raw['Close'].squeeze()
+log_ret   = np.log(spy_close / spy_close.shift(1))
+rv_raw    = log_ret.rolling(RV_WINDOW).std() * ANNUALIZE
+
+# VIX: convert from percentage points to decimal
+vix_close = vix_raw['Close'].squeeze() / 100.0
+
+# Align series, drop NaNs
+df = pd.DataFrame({
+    'RV':  rv_raw,
+    'VIX': vix_close,
+}).dropna()
+
+# Observation series fed into Kalman filter
+y_t  = df['RV'].values       # noisy realized vol proxy
+iv_t = df['VIX'].values      # implied vol (Q-measure benchmark)
+T    = len(y_t)
+dates = df.index
+
+print(f"Observations: {T} days ({dates[0].date()} to {dates[-1].date()})")
+print(f"RV  — mean: {y_t.mean():.4f}  std: {y_t.std():.4f}  "
+      f"min: {y_t.min():.4f}  max: {y_t.max():.4f}")
+print(f"VIX — mean: {iv_t.mean():.4f}  std: {iv_t.std():.4f}  "
+      f"min: {iv_t.min():.4f}  max: {iv_t.max():.4f}")
+
+# Quick sanity plot
+fig, ax = plt.subplots()
+ax.plot(dates, y_t,  label='Realized Vol (21-day)', alpha=0.7, lw=1)
+ax.plot(dates, iv_t, label='VIX (Implied Vol)',      alpha=0.8, lw=1.2)
+ax.set_title('Step 1: Raw Data — Realized vs Implied Volatility')
+ax.set_ylabel('Volatility (decimal)')
+ax.legend()
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.tight_layout()
+plt.show()
+
+
+# =============================================================================
+# CELL 3 | Step 2 — SDE Specification (Ornstein-Uhlenbeck)
+# =============================================================================
+#
+# Latent volatility modeled as OU process:
+#   dσ_t = κ(θ − σ_t) dt + ξ dW_t
+#
+# Closed-form solution via Itô's Lemma:
+#   σ_t = θ + (σ_0 − θ)e^{−κt} + ξ ∫_0^t e^{−κ(t−s)} dW_s
+#
+# Conditional moments (parameterize Kalman transition):
+#   E[σ_t | σ_0]   = θ + (σ_0 − θ) e^{−κt}
+#   Var[σ_t | σ_0] = (ξ²/2κ)(1 − e^{−2κt})
+#
+# These moments map directly to the state-space parameters in Step 3.
+# =============================================================================
+
+def ou_to_ss(kappa, theta, xi, dt=1/252):
+    """
+    Convert OU parameters (kappa, theta, xi) to discrete-time
+    state-space parameters (alpha, beta, Q) via the Ito's lemma
+    conditional moments. Derivation in paper Section 4.3.
+
+    Parameters
+    ----------
+    kappa : float  — mean reversion speed
+    theta : float  — long-run mean volatility
+    xi    : float  — volatility of volatility
+    dt    : float  — time step in years (1/252 for daily)
+
+    Returns
+    -------
+    alpha : float  — state-space intercept
+    beta  : float  — state-space AR coefficient
+    Q     : float  — process noise variance
+    """
+    beta  = np.exp(-kappa * dt)
+    alpha = theta * (1 - beta)
+    Q     = (xi**2 / (2 * kappa)) * (1 - np.exp(-2 * kappa * dt))
+    return alpha, beta, Q
+
+# Demonstrate the mapping with sample parameters
+kappa_demo, theta_demo, xi_demo = 5.0, y_t.mean(), y_t.std()
+alpha_d, beta_d, Q_d = ou_to_ss(kappa_demo, theta_demo, xi_demo)
+
+print("OU → State-Space parameter mapping (demo values):")
+print(f"  OU:  κ={kappa_demo:.2f}  θ={theta_demo:.4f}  ξ={xi_demo:.4f}")
+print(f"  SS:  α={alpha_d:.6f}  β={beta_d:.6f}  Q={Q_d:.8f}")
+print()
+print("Stationary distribution of OU process:")
+print(f"  Mean     = θ = {theta_demo:.4f}")
+print(f"  Variance = ξ²/2κ = {xi_demo**2 / (2*kappa_demo):.6f}")
+
+
+# =============================================================================
+# CELL 4 | Step 3 — State-Space Construction
+# =============================================================================
+#
+# Transition:   σ_{t+1} = α + β σ_t + w_t,  w_t ~ N(0, Q)
+# Observation:  y_t     = σ_t + v_t,         v_t ~ N(0, R)
+#
+# α, β, Q are exact functions of (κ, θ, ξ) via Itô's lemma (Cell 3).
+# R is the measurement noise variance — estimated in Step 4.
+# =============================================================================
+
+def build_kalman_matrices(kappa, theta, xi, R, dt=1/252):
+    """
+    Construct state-space matrices from OU parameters.
+    Convention:
+        x_{t+1} = F x_t + b + w_t     (transition)
+        y_t     = H x_t + v_t         (observation)
+
+    Returns
+    -------
+    Dictionary of Kalman matrices (alpha, beta, Q, R, initial state)
+    """
+    alpha, beta, Q = ou_to_ss(kappa, theta, xi, dt)
+
+    return {
+        'transition_matrices':     np.array([[beta]]),
+        'transition_offsets':      np.array([alpha]),
+        'observation_matrices':    np.array([[1.0]]),
+        'observation_offsets':     np.array([0.0]),
+        'transition_covariance':   np.array([[Q]]),
+        'observation_covariance':  np.array([[R]]),
+        'initial_state_mean':      np.array([theta]),
+        'initial_state_covariance':np.array([[xi**2 / (2 * kappa)]]),
+    }
+
+print("State-space construction function defined.")
+print("Observation equation: y_t = σ_t + v_t, v_t ~ N(0, R)")
+print("Transition equation:  σ_{t+1} = α + β σ_t + w_t, w_t ~ N(0, Q)")
+
+
+# =============================================================================
+# CELL 5 | Step 4A — Parameter Estimation via EM Algorithm (numpy only)
+# =============================================================================
+#
+# Primary method: EM algorithm (Expectation-Maximization)
+#   E-step: Kalman smoother — forward filter + backward (RTS) smoother pass
+#   M-step: update (alpha, beta, Q, R) to maximize expected log-likelihood
+#
+# Implemented from scratch in numpy — no pykalman dependency.
+# =============================================================================
+
+def kalman_smoother_em(y, alpha, beta, Q, R, theta, xi, kappa, dt=1/252):
+    """
+    Kalman forward filter + RTS backward smoother.
+    Returns smoothed means, smoothed variances, and cross-covariances
+    needed for the EM M-step.
+    """
+    T = len(y)
+
+    # --- Forward filter ---
+    sigma_f  = np.zeros(T)     # filtered means
+    P_f      = np.zeros(T)     # filtered variances
+    sigma_p  = np.zeros(T)     # predicted means
+    P_p      = np.zeros(T)     # predicted variances
+
+    sigma_prev = theta
+    P_prev     = xi**2 / (2 * kappa)
+
+    for t in range(T):
+        sigma_p[t] = alpha + beta * sigma_prev
+        P_p[t]     = beta**2 * P_prev + Q
+
+        S          = P_p[t] + R
+        K          = P_p[t] / S
+        sigma_f[t] = sigma_p[t] + K * (y[t] - sigma_p[t])
+        P_f[t]     = (1 - K) * P_p[t]
+
+        sigma_prev = sigma_f[t]
+        P_prev     = P_f[t]
+
+    # --- RTS backward smoother ---
+    sigma_s = np.zeros(T)     # smoothed means
+    P_s     = np.zeros(T)     # smoothed variances
+    P_cross = np.zeros(T)     # cross-covariance E[x_t x_{t-1} | Y]
+
+    sigma_s[-1] = sigma_f[-1]
+    P_s[-1]     = P_f[-1]
+
+    for t in range(T-2, -1, -1):
+        G           = P_f[t] * beta / P_p[t+1]
+        sigma_s[t]  = sigma_f[t] + G * (sigma_s[t+1] - sigma_p[t+1])
+        P_s[t]      = P_f[t]  + G**2 * (P_s[t+1] - P_p[t+1])
+        P_cross[t+1]= G * P_s[t+1]
+
+    return sigma_s, P_s, P_cross, sigma_f, P_f
+
+
+def run_em(y, n_iter=80, dt=1/252):
+    """
+    Full EM loop for OU state-space model.
+    Initializes from sample moments and iterates E/M steps.
+    Returns estimated OU parameters (kappa, theta, xi, R).
+    """
+    T = len(y)
+
+    # --- Initialization from sample moments ---
+    theta = float(np.mean(y))
+    xi    = float(np.std(y)) * 0.5
+    kappa = 5.0                        # ~50-day half-life starting point
+    R     = float(np.var(y)) * 0.1
+
+    alpha, beta, Q = ou_to_ss(kappa, theta, xi, dt)
+
+    prev_ll = -np.inf
+
+    for iteration in range(n_iter):
+        # --- E-step: Kalman smoother ---
+        sigma_s, P_s, P_cross, sigma_f, P_f = kalman_smoother_em(
+            y, alpha, beta, Q, R, theta, xi, kappa, dt
+        )
+
+        # Sufficient statistics for M-step
+        # E[x_t^2]
+        Ex2      = P_s + sigma_s**2
+        # E[x_t x_{t-1}]
+        Ext_xt1  = P_cross[1:] + sigma_s[1:] * sigma_s[:-1]
+
+        # --- M-step: update parameters ---
+        # Update beta (AR coefficient) and alpha (intercept)
+        # From MLE of transition: sigma_{t+1} = alpha + beta*sigma_t + w_t
+        S_xx  = Ex2[:-1].sum()
+        S_yx  = Ext_xt1.sum()
+        S_yy  = Ex2[1:].sum()
+        S_x   = sigma_s[:-1].sum()
+        S_y   = sigma_s[1:].sum()
+        n     = T - 1
+
+        denom = n * S_xx - S_x**2
+        beta  = (n * S_yx - S_x * S_y) / denom
+        alpha = (S_y - beta * S_x) / n
+
+        # Update Q (process noise)
+        Q = (S_yy - beta * S_yx - alpha * S_y
+             - beta * S_yx + beta**2 * S_xx + alpha * beta * S_x
+             - alpha * S_y + alpha * beta * S_x + alpha**2 * n) / n
+        Q = max(Q, 1e-10)   # numerical floor
+
+        # Update R (measurement noise)
+        # Floor at 5% of sample variance — rolling RV is noisy by construction
+        # (21-day overlapping windows), so R collapsing to zero is not valid
+        R_min = float(np.var(y)) * 0.05
+        R = float(np.mean((y - sigma_s)**2 + P_s))
+        R = max(R, R_min)
+
+        # Back out OU parameters
+        beta  = np.clip(beta, 1e-6, 1 - 1e-6)
+        kappa = -np.log(beta) / dt
+        theta_new = alpha / (1 - beta)
+        xi_new    = np.sqrt(max(Q * 2 * kappa / (1 - np.exp(-2 * kappa * dt)), 1e-10))
+
+        theta = theta_new
+        xi    = xi_new
+        alpha, beta_new, Q = ou_to_ss(kappa, theta, xi, dt)
+        beta = beta_new
+
+        # Monitor log-likelihood for convergence
+        ll = -0.5 * np.sum((y - sigma_f)**2 / (P_f + R) + np.log(P_f + R))
+        if abs(ll - prev_ll) < 1e-6 and iteration > 5:
+            print(f"  EM converged at iteration {iteration+1}  |  LL = {ll:.4f}")
+            break
+        prev_ll = ll
+
+    return kappa, theta, xi, R
+
+
+print("Running EM parameter estimation (numpy, no external dependencies)...")
+print("(Typically converges in 20-60 iterations)")
+
+kappa_em, theta_em, xi_em, R_em = run_em(y_t, n_iter=80)
+alpha_em, beta_em, Q_em = ou_to_ss(kappa_em, theta_em, xi_em)
+
+print("\nEM Estimated Parameters:")
+print(f"  OU:          κ={kappa_em:.4f}  θ={theta_em:.4f}  ξ={xi_em:.4f}  R={R_em:.8f}")
+print(f"  State-space: α={alpha_em:.6f}  β={beta_em:.6f}  Q={Q_em:.8f}")
+print(f"  Half-life of mean reversion: {np.log(2)/kappa_em * 252:.1f} trading days")
+
+
+# =============================================================================
+# CELL 6 | Step 4B — Parameter Estimation via MLE (scipy cross-check)
+# =============================================================================
+#
+# Cross-check using prediction error decomposition:
+#   log L = -T/2 log(2π) - 1/2 Σ_t [log(P_{t|t-1} + R) + ν_t²/(P_{t|t-1} + R)]
+#
+# Maximize over (κ, θ, ξ, R).
+# =============================================================================
+
+def kalman_nll(params, y, dt=1/252):
+    """
+    Negative log-likelihood via prediction error decomposition.
+    Used for MLE cross-check against EM estimates.
+    """
+    kappa, theta, xi, R = params
+
+    # Parameter constraints — return large penalty if violated
+    if kappa <= 0 or xi <= 0 or R <= 0 or theta <= 0:
+        return 1e10
+
+    alpha, beta, Q = ou_to_ss(kappa, theta, xi, dt)
+    T = len(y)
+
+    # Initialize filter
+    sigma_hat = theta
+    P = xi**2 / (2 * kappa)
+    nll = 0.0
+
+    for t in range(T):
+        # Prediction step
+        sigma_pred = alpha + beta * sigma_hat
+        P_pred     = beta**2 * P + Q
+
+        # Innovation
+        S   = P_pred + R           # innovation variance
+        nu  = y[t] - sigma_pred    # innovation
+
+        # Log-likelihood contribution
+        nll += 0.5 * (np.log(2 * np.pi * S) + nu**2 / S)
+
+        # Update step
+        K         = P_pred / S
+        sigma_hat = sigma_pred + K * nu
+        P         = (1 - K) * P_pred
+
+    return nll
+
+# Initial guess from EM estimates — warm start
+x0 = [kappa_em, theta_em, xi_em, R_em]
+
+# Bounds: all parameters positive, R bounded below at 5% of sample variance
+# to prevent filter collapse (K_t -> 1, no smoothing)
+R_min = float(np.var(y_t)) * 0.05
+bounds = [(0.1, 200), (0.01, 1.0), (0.001, 2.0), (R_min, 0.5)]
+
+print("Running MLE cross-check via scipy.optimize ...")
+result = minimize(
+    kalman_nll,
+    x0=x0,
+    args=(y_t,),
+    method='L-BFGS-B',
+    bounds=bounds,
+    options={'maxiter': 1000, 'ftol': 1e-12}
+)
+
+kappa_mle, theta_mle, xi_mle, R_mle = result.x
+
+print(f"\nMLE Estimated Parameters:")
+print(f"  κ={kappa_mle:.4f}  θ={theta_mle:.4f}  ξ={xi_mle:.4f}  R={R_mle:.8f}")
+print(f"  Half-life: {np.log(2)/kappa_mle * 252:.1f} trading days")
+print(f"  Convergence: {result.success}  |  NLL: {result.fun:.4f}")
+
+print("\nEM vs MLE Comparison:")
+print(f"  {'Param':<8} {'EM':>10} {'MLE':>10} {'Diff %':>10}")
+for name, em_val, mle_val in zip(
+    ['kappa', 'theta', 'xi', 'R'],
+    [kappa_em, theta_em, xi_em, R_em],
+    [kappa_mle, theta_mle, xi_mle, R_mle]
+):
+    diff_pct = abs(em_val - mle_val) / (abs(mle_val) + 1e-12) * 100
+    print(f"  {name:<8} {em_val:>10.5f} {mle_val:>10.5f} {diff_pct:>9.2f}%")
+
+# Use MLE as primary (EM as initialization, MLE as final)
+# If MLE diverges or fails to converge, fall back to EM
+if result.success and abs(kappa_mle - kappa_em) / kappa_em < 0.5:
+    kappa_final, theta_final, xi_final, R_final = kappa_mle, theta_mle, xi_mle, R_mle
+    print("\nUsing MLE parameters as final estimates.")
+else:
+    kappa_final, theta_final, xi_final, R_final = kappa_em, theta_em, xi_em, R_em
+    print("\nMLE unstable — using EM parameters as final estimates.")
+
+
+# =============================================================================
+# CELL 7 | Step 5 — Kalman Filter Recursion
+# =============================================================================
+#
+# Predict:   σ̂_{t|t-1} = α + β σ̂_{t-1|t-1}
+#            P_{t|t-1}  = β² P_{t-1|t-1} + Q
+#
+# Update:    K_t        = P_{t|t-1} / (P_{t|t-1} + R)
+#            σ̂_{t|t}   = σ̂_{t|t-1} + K_t · ν_t
+#            P_{t|t}    = (1 - K_t) · P_{t|t-1}
+#
+# Diagnostic: Ljung-Box test on innovations ν_t for whiteness.
+# =============================================================================
+
+def run_kalman_filter(y, kappa, theta, xi, R, dt=1/252):
+    """
+    Forward Kalman filter recursion for the OU state-space model.
+    Returns filtered state estimates, posterior variances, and innovations.
+
+    Parameters
+    ----------
+    y     : array-like  — observation series (noisy realized vol)
+    kappa : float       — mean reversion speed
+    theta : float       — long-run mean
+    xi    : float       — vol of vol
+    R     : float       — measurement noise variance
+    dt    : float       — time step in years
+
+    Returns
+    -------
+    sigma_hat : np.array  — filtered state estimates σ̂_{t|t}
+    P_t       : np.array  — posterior variances P_{t|t}
+    nu_t      : np.array  — innovations ν_t = y_t − σ̂_{t|t-1}
+    K_t       : np.array  — Kalman gains
+    """
+    alpha, beta, Q = ou_to_ss(kappa, theta, xi, dt)
+    T = len(y)
+
+    sigma_hat = np.zeros(T)
+    P_t       = np.zeros(T)
+    nu_t      = np.zeros(T)
+    K_t       = np.zeros(T)
+
+    # Initialize at stationary distribution
+    sigma_hat_prev = theta
+    P_prev         = xi**2 / (2 * kappa)
+
+    for t in range(T):
+        # --- Prediction step ---
+        sigma_pred = alpha + beta * sigma_hat_prev
+        P_pred     = beta**2 * P_prev + Q
+
+        # --- Innovation ---
+        nu_t[t] = y[t] - sigma_pred
+
+        # --- Kalman gain ---
+        K_t[t] = P_pred / (P_pred + R)
+
+        # --- Update step ---
+        sigma_hat[t] = sigma_pred + K_t[t] * nu_t[t]
+        P_t[t]       = (1 - K_t[t]) * P_pred
+
+        # Carry forward
+        sigma_hat_prev = sigma_hat[t]
+        P_prev         = P_t[t]
+
+    return sigma_hat, P_t, nu_t, K_t
+
+
+# Run filter with final estimated parameters
+sigma_hat, P_t, nu_t, K_t = run_kalman_filter(
+    y_t, kappa_final, theta_final, xi_final, R_final
+)
+
+print("Kalman filter complete.")
+print(f"  Filtered vol — mean: {sigma_hat.mean():.4f}  std: {sigma_hat.std():.4f}")
+print(f"  Mean Kalman gain K_t: {K_t.mean():.4f}  "
+      f"(higher = more trust in observations)")
+
+# --- Diagnostic: Ljung-Box test on innovations ---
+lb_result = acorr_ljungbox(nu_t, lags=[10, 20, 30], return_df=True)
+print("\nLjung-Box test on innovations ν_t (H0: no autocorrelation):")
+print(lb_result[['lb_stat', 'lb_pvalue']].round(4))
+if (lb_result['lb_pvalue'] > 0.05).all():
+    print("  → Innovations are white. Model specification is adequate.")
+else:
+    print("  → Autocorrelation detected. OU assumption may be too restrictive.")
+    print("    Consider: jump-diffusion extension or regime-switching parameters.")
+
+# --- Plot 1: Filtered latent vol vs raw observations ---
+fig, ax = plt.subplots()
+ax.fill_between(dates,
+                sigma_hat - 1.96*np.sqrt(P_t),
+                sigma_hat + 1.96*np.sqrt(P_t),
+                alpha=0.15, color='navy', label='95% CI', zorder=1)
+ax.plot(dates, sigma_hat, label='Kalman filtered σ̂_{t|t}', lw=1.8, color='navy',      zorder=2)
+ax.plot(dates, y_t,       label='Observed RV (noisy)',      lw=0.9, color='steelblue', alpha=0.7, zorder=3)
+ax.set_title('Step 5: Kalman Filtered Latent Volatility vs Raw Realized Vol')
+ax.set_ylabel('Volatility (decimal)')
+ax.legend()
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+plt.tight_layout()
+plt.show()
+
+# --- Plot 2: Innovations diagnostic ---
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+axes[0].plot(dates, nu_t, lw=0.8, color='gray', alpha=0.8)
+axes[0].axhline(0, color='black', lw=0.8, ls='--')
+axes[0].set_title('Innovations ν_t = y_t − σ̂_{t|t-1}')
+axes[0].set_ylabel('Innovation')
+axes[0].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+
+from statsmodels.graphics.tsaplots import plot_acf
+plot_acf(nu_t, lags=40, ax=axes[1], alpha=0.05, title='ACF of Innovations')
+plt.tight_layout()
+plt.show()
+
+
+# =============================================================================
+# CELL 8 | Step 6 — VRP Signal Construction
+# =============================================================================
+#
+# VRP_t = IV30_t − σ̂_{t|t}
+#
+# VRP_t > 0: market overprices vol → short-vol edge (Iron Condor)
+# VRP_t ≤ 0: implied ≤ realized → no edge, stand aside
+# =============================================================================
+
+vrp = iv_t - sigma_hat
+
+print("VRP Signal Summary:")
+print(f"  Mean VRP:         {vrp.mean():.4f}  ({vrp.mean()*100:.2f} vol points)")
+print(f"  Std VRP:          {vrp.std():.4f}")
+print(f"  % positive:       {(vrp > 0).mean()*100:.1f}%")
+print(f"  Min / Max:        {vrp.min():.4f} / {vrp.max():.4f}")
+
+fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+
+# Top panel: three vol series
+axes[0].plot(dates, y_t,       label='RV (observed)',         alpha=0.4, lw=1,   color='steelblue')
+axes[0].plot(dates, sigma_hat, label='Latent vol σ̂_{t|t}',   lw=1.5,           color='navy')
+axes[0].plot(dates, iv_t,      label='VIX (implied vol)',     lw=1.2,           color='crimson')
+axes[0].set_ylabel('Volatility (decimal)')
+axes[0].set_title('Step 6: Implied vs Latent Realized Volatility')
+axes[0].legend(fontsize=9)
+
+# Bottom panel: VRP signal
+axes[1].fill_between(dates, vrp, 0,
+                     where=(vrp > 0), color='green', alpha=0.4, label='VRP > 0 (short-vol edge)')
+axes[1].fill_between(dates, vrp, 0,
+                     where=(vrp <= 0), color='red',  alpha=0.3, label='VRP ≤ 0 (no edge)')
+axes[1].axhline(0, color='black', lw=0.8, ls='--')
+axes[1].plot(dates, vrp, lw=0.8, color='black', alpha=0.6)
+axes[1].set_ylabel('VRP = VIX − σ̂')
+axes[1].set_title('VRP Signal')
+axes[1].legend(fontsize=9)
+axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+
+plt.tight_layout()
+plt.show()
+
+
+# =============================================================================
+# CELL 9 | Step 7 — Signal Evaluation and Regime Analysis
+# =============================================================================
+#
+# Evaluate VRP on: mean, persistence (ACF, half-life), Sharpe-like ratio,
+# significance (Newey-West HAC t-test), and regime-conditional breakdowns.
+# Compare Kalman latent vol to raw RV as a baseline.
+# =============================================================================
+
+from statsmodels.stats.sandwich_covariance import cov_hac
+
+# --- 7A: Overall signal statistics ---
+vrp_series = pd.Series(vrp, index=dates, name='VRP')
+
+# Newey-West HAC t-test for mean VRP != 0
+# Regress VRP on a constant only — cov_hac[0,0] is the HAC variance of that constant
+X      = np.ones((T, 1))
+ols    = OLS(vrp, X).fit()
+nw_se  = np.sqrt(cov_hac(ols)[0, 0])
+t_stat = vrp.mean() / nw_se
+p_val  = 2 * t_dist.sf(abs(t_stat), df=T-1)
+
+# Annualized Sharpe-like ratio
+sharpe = vrp.mean() / vrp.std() * np.sqrt(252)
+
+# Autocorrelation half-life (AR(1) approximation)
+rho1     = np.corrcoef(vrp[:-1], vrp[1:])[0, 1]
+half_life = -np.log(2) / np.log(abs(rho1)) if abs(rho1) < 1 else np.inf
+
+print("=" * 55)
+print("  VRP Signal Evaluation — Full Sample")
+print("=" * 55)
+print(f"  Mean VRP:          {vrp.mean():.5f}  ({vrp.mean()*100:.3f} vol pts)")
+print(f"  Std VRP:           {vrp.std():.5f}")
+print(f"  Newey-West t-stat: {t_stat:.3f}")
+print(f"  p-value (2-sided): {p_val:.4f}  {'***' if p_val<0.01 else '**' if p_val<0.05 else '*' if p_val<0.1 else ''}")
+print(f"  Sharpe-like ratio: {sharpe:.3f}")
+print(f"  AR(1) ρ:           {rho1:.4f}")
+print(f"  Half-life:         {half_life:.1f} days")
+print(f"  % positive:        {(vrp > 0).mean()*100:.1f}%")
+
+# --- 7B: Regime analysis ---
+regimes = {
+    'Low-vol (2015-2019)':      (dates >= '2015-01-01') & (dates < '2020-01-01'),
+    'COVID crisis (2020)':      (dates >= '2020-01-01') & (dates < '2021-01-01'),
+    'Recovery (2021-2025)':     (dates >= '2021-01-01'),
+}
+
+print("\n" + "=" * 55)
+print("  Regime-Conditional VRP Analysis")
+print("=" * 55)
+print(f"  {'Regime':<28} {'Mean':>7} {'Std':>7} {'Sharpe':>8} {'% Pos':>7} {'N':>6}")
+print("  " + "-" * 53)
+
+regime_stats = {}
+for label, mask in regimes.items():
+    v   = vrp[mask]
+    sh  = v.mean() / v.std() * np.sqrt(252) if v.std() > 0 else np.nan
+    pct = (v > 0).mean() * 100
+    regime_stats[label] = {'mean': v.mean(), 'std': v.std(), 'sharpe': sh, 'pct_pos': pct, 'n': len(v)}
+    print(f"  {label:<28} {v.mean():>7.4f} {v.std():>7.4f} {sh:>8.3f} {pct:>6.1f}% {len(v):>6}")
+
+# --- 7C: Kalman vs raw RV baseline comparison ---
+vrp_raw = iv_t - y_t       # naive VRP: VIX minus raw rolling RV
+sharpe_raw    = vrp_raw.mean() / vrp_raw.std() * np.sqrt(252)
+sharpe_kalman = sharpe
+
+print("\n" + "=" * 55)
+print("  Kalman Filtered VRP vs Raw RV Baseline")
+print("=" * 55)
+print(f"  {'Method':<30} {'Mean VRP':>10} {'Std VRP':>10} {'Sharpe':>8}")
+print("  " + "-" * 60)
+print(f"  {'Kalman latent vol':<30} {vrp.mean():>10.5f} {vrp.std():>10.5f} {sharpe_kalman:>8.3f}")
+print(f"  {'Raw rolling RV (baseline)':<30} {vrp_raw.mean():>10.5f} {vrp_raw.std():>10.5f} {sharpe_raw:>8.3f}")
+print(f"\n  Kalman smoothing reduces VRP std by {(1 - vrp.std()/vrp_raw.std())*100:.1f}% "
+      f"({'improving' if sharpe_kalman > sharpe_raw else 'reducing'} Sharpe)")
+
+# --- 7D: Regime plot ---
+fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=False)
+regime_colors = ['steelblue', 'crimson', 'forestgreen']
+
+for ax, (label, mask), color in zip(axes, regimes.items(), regime_colors):
+    v = vrp[mask]
+    d = dates[mask]
+    ax.fill_between(d, v, 0, where=(v>0), color='green', alpha=0.35)
+    ax.fill_between(d, v, 0, where=(v<=0), color='red',  alpha=0.25)
+    ax.plot(d, v, lw=0.9, color=color, alpha=0.8)
+    ax.axhline(0, color='black', lw=0.8, ls='--')
+    ax.axhline(v.mean(), color=color, lw=1.2, ls=':', label=f'Mean = {v.mean():.4f}')
+    ax.set_title(f'{label}  |  Sharpe = {regime_stats[label]["sharpe"]:.3f}')
+    ax.set_ylabel('VRP')
+    ax.legend(fontsize=9)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+
+plt.suptitle('Step 7: VRP Regime Analysis', fontsize=13, y=1.01)
+plt.tight_layout()
+plt.show()
+
+# --- 7E: Final summary figure ---
+fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
+
+# Panel 1: All three vol series — RV drawn last so it stays visible on top
+axes[0].fill_between(dates,
+                     sigma_hat - 1.96*np.sqrt(P_t),
+                     sigma_hat + 1.96*np.sqrt(P_t),
+                     alpha=0.12, color='navy', zorder=1)
+axes[0].plot(dates, sigma_hat, lw=2.0, color='navy',      label='Kalman σ̂_{t|t}',   zorder=2)
+axes[0].plot(dates, iv_t,      lw=1.4, color='crimson',   label='VIX (implied)',      zorder=3)
+axes[0].plot(dates, y_t,       lw=0.9, color='steelblue', label='Realized Vol (raw)', alpha=0.75, zorder=4)
+
+# Shade regimes
+regime_bg = [('2020-01-01','2021-01-01','lightyellow')]
+for r_start, r_end, rc in regime_bg:
+    axes[0].axvspan(pd.Timestamp(r_start), pd.Timestamp(r_end), color=rc, alpha=0.5, label='COVID crisis')
+
+axes[0].set_ylabel('Volatility (decimal)')
+axes[0].set_title('Latent Volatility as a Stochastic Process: Full Sample Results')
+axes[0].legend(fontsize=9, loc='upper left')
+
+# Panel 2: VRP signal
+axes[1].fill_between(dates, vrp, 0,
+                     where=(vrp>0),  color='green', alpha=0.4, label='VRP > 0')
+axes[1].fill_between(dates, vrp, 0,
+                     where=(vrp<=0), color='red',   alpha=0.3, label='VRP ≤ 0')
+axes[1].plot(dates, vrp, lw=0.8, color='black', alpha=0.5)
+axes[1].axhline(0, color='black', lw=0.8, ls='--')
+axes[1].axhline(vrp.mean(), color='green', lw=1.2, ls=':',
+                label=f'Mean VRP = {vrp.mean():.4f}')
+axes[1].set_ylabel('VRP = VIX − σ̂')
+axes[1].set_title(f'VRP Signal  |  Mean = {vrp.mean():.4f}  |  Sharpe = {sharpe:.3f}  |  NW t = {t_stat:.2f}')
+axes[1].legend(fontsize=9, loc='upper left')
+axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+
+plt.tight_layout()
+plt.savefig('vrp_kalman_results.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("\nFigure saved to vrp_kalman_results.png")
+print("\nPipeline complete.")
+
+
+# =============================================================================
+# CELL 10 | Section 6.4 Extension — Kernel Baseline, Extended Regime Stats,
+#           and March 2020 VRP Sign Flip Analysis
+#
+# Delivers three things the paper needs for the regime-centered narrative:
+#   (a) Gaussian kernel smoother as the static baseline (Section 6.4)
+#   (b) Per-regime VRP half-life and inter-regime Sharpe significance test
+#   (c) March 2020 sign-flip characterization for Section 6.3
+# =============================================================================
+
+from scipy.stats import ttest_ind
+
+# -------------------------------------------------------------------------
+# 10A: Gaussian Kernel Smoother — Static Baseline (Section 6.4)
+# -------------------------------------------------------------------------
+
+def gaussian_kernel_smooth(y, bandwidth=63):
+    """
+    Nadaraya-Watson kernel smoother with Gaussian kernel.
+    Produces a static smoothed estimate of the vol series.
+    Bandwidth h controls smoothness (in trading days, default ~1 quarter).
+    """
+    T = len(y)
+    y_smooth = np.zeros(T)
+    t_idx = np.arange(T, dtype=float)
+    for t in range(T):
+        weights = np.exp(-0.5 * ((t_idx - t) / bandwidth) ** 2)
+        y_smooth[t] = np.sum(weights * y) / np.sum(weights)
+    return y_smooth
+
+print("Computing Gaussian kernel smoother (bandwidth = 63 days) ...")
+sigma_kernel = gaussian_kernel_smooth(y_t, bandwidth=63)
+
+vrp_kernel = iv_t - sigma_kernel
+vrp_kalman = vrp   # alias for clarity
+
+sharpe_kernel     = vrp_kernel.mean() / vrp_kernel.std() * np.sqrt(252)
+sharpe_kalman_val = vrp_kalman.mean() / vrp_kalman.std() * np.sqrt(252)
+sharpe_raw_val    = vrp_raw.mean() / vrp_raw.std() * np.sqrt(252)
+
+print("\n" + "=" * 65)
+print("  Section 6.4 — Kalman vs Static Kernel vs Raw RV Baseline")
+print("=" * 65)
+print(f"  {'Method':<30} {'Mean VRP':>10} {'Std VRP':>10} {'Sharpe':>8}")
+print("  " + "-" * 62)
+print(f"  {'Kalman latent vol (dynamic)':<30} {vrp_kalman.mean():>10.5f} "
+      f"{vrp_kalman.std():>10.5f} {sharpe_kalman_val:>8.3f}")
+print(f"  {'Kernel smoother (static)':<30} {vrp_kernel.mean():>10.5f} "
+      f"{vrp_kernel.std():>10.5f} {sharpe_kernel:>8.3f}")
+print(f"  {'Raw rolling RV (naive)':<30} {vrp_raw.mean():>10.5f} "
+      f"{vrp_raw.std():>10.5f} {sharpe_raw_val:>8.3f}")
+
+print(f"\n  Latent state noise reduction vs raw RV:")
+print(f"    Kalman sigma_hat std: {sigma_hat.std():.5f}  "
+      f"(reduction: {(1 - sigma_hat.std()/y_t.std())*100:.1f}%)")
+print(f"    Kernel sigma_hat std: {sigma_kernel.std():.5f}  "
+      f"(reduction: {(1 - sigma_kernel.std()/y_t.std())*100:.1f}%)")
+print(f"\n  Key distinction: the kernel smoother reduces noise by over-smoothing")
+print(f"  and loses responsiveness to structural breaks (e.g. COVID spike).")
+print(f"  The Kalman filter adapts dynamically via P_t, preserving")
+print(f"  responsiveness while filtering measurement noise.")
+
+# -------------------------------------------------------------------------
+# 10B: Per-Regime Half-Life and Inter-Regime Sharpe Significance Test
+# -------------------------------------------------------------------------
+
+print("\n" + "=" * 65)
+print("  Extended Regime Analysis — Half-Life and Significance Tests")
+print("=" * 65)
+
+regime_vrp = {}
+for label, mask in regimes.items():
+    v   = vrp_kalman[mask]
+    rho = np.corrcoef(v[:-1], v[1:])[0, 1] if len(v) > 2 else np.nan
+    hl  = -np.log(2) / np.log(abs(rho)) if abs(rho) < 1 else np.inf
+    sh  = v.mean() / v.std() * np.sqrt(252)
+    regime_vrp[label] = v
+    print(f"\n  {label}")
+    print(f"    Mean: {v.mean():.4f}  Std: {v.std():.4f}  "
+          f"Sharpe: {sh:.3f}  Half-life: {hl:.1f} days  AR(1) rho: {rho:.4f}")
+
+# Pairwise Welch t-tests on regime VRP means
+regime_labels = list(regime_vrp.keys())
+print(f"\n  Pairwise regime mean VRP difference tests (Welch t-test):")
+print(f"  {'Comparison':<45} {'t-stat':>8} {'p-value':>10} {'Sig':>5}")
+print("  " + "-" * 72)
+pairs = [
+    (regime_labels[0], regime_labels[1]),
+    (regime_labels[0], regime_labels[2]),
+    (regime_labels[1], regime_labels[2]),
+]
+for a, b in pairs:
+    t_val, p_val_r = ttest_ind(regime_vrp[a], regime_vrp[b], equal_var=False)
+    sig = '***' if p_val_r < 0.01 else '**' if p_val_r < 0.05 else '*' if p_val_r < 0.1 else ''
+    label_str = f"{a[:22]} vs {b[:22]}"
+    print(f"  {label_str:<45} {t_val:>8.3f} {p_val_r:>10.4f} {sig:>5}")
+
+# -------------------------------------------------------------------------
+# 10C: March 2020 VRP Sign Flip Analysis (Section 6.3)
+# -------------------------------------------------------------------------
+
+print("\n" + "=" * 65)
+print("  Section 6.3 — March 2020 VRP Sign Flip Characterization")
+print("=" * 65)
+
+crisis_mask  = (dates >= '2020-02-01') & (dates <= '2020-05-31')
+crisis_dates = dates[crisis_mask]
+vrp_crisis   = vrp_kalman[crisis_mask]
+rv_crisis    = y_t[crisis_mask]
+vix_crisis   = iv_t[crisis_mask]
+sigma_crisis = sigma_hat[crisis_mask]
+
+neg_mask  = vrp_crisis < 0
+neg_dates = crisis_dates[neg_mask]
+
+print(f"\n  Crisis window: Feb 1 to May 31 2020  ({crisis_mask.sum()} trading days)")
+print(f"  Days VRP < 0:  {neg_mask.sum()} ({neg_mask.mean()*100:.1f}% of crisis window)")
+if neg_mask.sum() > 0:
+    print(f"  First negative: {neg_dates[0].date()}")
+    print(f"  Last negative:  {neg_dates[-1].date()}")
+print(f"\n  Peak realized vol:  {rv_crisis.max():.4f}  "
+      f"({crisis_dates[rv_crisis.argmax()].date()})")
+print(f"  Peak VIX:           {vix_crisis.max():.4f}  "
+      f"({crisis_dates[vix_crisis.argmax()].date()})")
+print(f"  Trough VRP:         {vrp_crisis.min():.4f}  "
+      f"({crisis_dates[vrp_crisis.argmin()].date()})")
+print(f"  Peak VRP:           {vrp_crisis.max():.4f}  "
+      f"({crisis_dates[vrp_crisis.argmax()].date()})")
+print(f"\n  Interpretation: realized vol peaked AFTER VIX, as the market")
+print(f"  priced in the crash before it fully materialized in returns.")
+print(f"  The Kalman filter latent state tracked the realized vol surge,")
+print(f"  temporarily compressing and inverting the VRP signal.")
+
+# -------------------------------------------------------------------------
+# 10D: Plots
+# -------------------------------------------------------------------------
+
+# Plot 1: Three vol estimators comparison
+fig, axes = plt.subplots(2, 1, figsize=(13, 9), sharex=True)
+
+axes[0].fill_between(dates,
+                     sigma_hat - 1.96*np.sqrt(P_t),
+                     sigma_hat + 1.96*np.sqrt(P_t),
+                     alpha=0.10, color='navy', zorder=1)
+axes[0].plot(dates, sigma_kernel, lw=1.6, color='darkorange',
+             label='Kernel smoother (static)', ls='--', zorder=2)
+axes[0].plot(dates, sigma_hat,   lw=1.8, color='navy',
+             label='Kalman sigma_hat (dynamic)', zorder=3)
+axes[0].plot(dates, iv_t,        lw=1.2, color='crimson',
+             label='VIX (implied vol)', zorder=4)
+axes[0].plot(dates, y_t,         lw=0.8, color='steelblue', alpha=0.6,
+             label='Realized Vol (raw)', zorder=5)
+axes[0].axvspan(pd.Timestamp('2020-01-01'), pd.Timestamp('2021-01-01'),
+                color='lightyellow', alpha=0.6, label='COVID crisis')
+axes[0].set_ylabel('Volatility (decimal)')
+axes[0].set_title('Section 6.4: Kalman Filter vs Kernel Smoother vs Raw RV')
+axes[0].legend(fontsize=9, loc='upper left')
+
+axes[1].plot(dates, vrp_kalman, lw=1.2, color='navy',
+             label=f'Kalman VRP  (Sharpe={sharpe_kalman_val:.2f})', zorder=3)
+axes[1].plot(dates, vrp_kernel, lw=1.2, color='darkorange', ls='--',
+             label=f'Kernel VRP  (Sharpe={sharpe_kernel:.2f})', zorder=2, alpha=0.8)
+axes[1].axhline(0, color='black', lw=0.8, ls='--')
+axes[1].axhline(vrp_kalman.mean(), color='navy', lw=1.0, ls=':')
+axes[1].axhline(vrp_kernel.mean(), color='darkorange', lw=1.0, ls=':')
+axes[1].axvspan(pd.Timestamp('2020-01-01'), pd.Timestamp('2021-01-01'),
+                color='lightyellow', alpha=0.6)
+axes[1].set_ylabel('VRP = VIX - sigma_hat')
+axes[1].set_title('VRP Signal: Dynamic (Kalman) vs Static (Kernel) Estimation')
+axes[1].legend(fontsize=9)
+axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+
+plt.tight_layout()
+plt.savefig('vrp_kalman_vs_kernel.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# Plot 2: March 2020 closeup
+fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+
+axes[0].plot(crisis_dates, rv_crisis,    lw=1.2, color='steelblue',
+             label='Realized Vol (raw)', alpha=0.8)
+axes[0].plot(crisis_dates, sigma_crisis, lw=1.8, color='navy',
+             label='Kalman sigma_hat')
+axes[0].plot(crisis_dates, vix_crisis,   lw=1.4, color='crimson',
+             label='VIX (implied)')
+axes[0].set_ylabel('Volatility (decimal)')
+axes[0].set_title('Section 6.3: March 2020 VRP Sign Flip — Closeup')
+axes[0].legend(fontsize=9)
+
+axes[1].fill_between(crisis_dates, vrp_crisis, 0,
+                     where=(vrp_crisis > 0),  color='green', alpha=0.4, label='VRP > 0')
+axes[1].fill_between(crisis_dates, vrp_crisis, 0,
+                     where=(vrp_crisis <= 0), color='red',   alpha=0.4, label='VRP ≤ 0')
+axes[1].plot(crisis_dates, vrp_crisis, lw=1.2, color='black', alpha=0.7)
+axes[1].axhline(0, color='black', lw=0.8, ls='--')
+axes[1].set_ylabel('VRP = VIX - sigma_hat')
+axes[1].set_title('VRP Sign Flip During COVID Crash')
+axes[1].legend(fontsize=9)
+axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+
+plt.tight_layout()
+plt.savefig('vrp_march2020_closeup.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print("\nCell 10 complete.")
+print("Figures saved: vrp_kalman_vs_kernel.png, vrp_march2020_closeup.png")
